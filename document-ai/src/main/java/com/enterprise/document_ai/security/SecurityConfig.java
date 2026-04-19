@@ -19,16 +19,12 @@ public class SecurityConfig {
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
         http
             .csrf(csrf -> csrf.disable())
-
             .authorizeHttpRequests(auth -> auth
-                // All /api/v1/** endpoints require a valid Firebase JWT
                 .requestMatchers("/api/v1/**").authenticated()
                 .anyRequest().permitAll()
             )
-
             .addFilterBefore(firebaseTokenFilter,
                     org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter.class)
-
             .httpBasic(Customizer.withDefaults());
 
         return http.build();

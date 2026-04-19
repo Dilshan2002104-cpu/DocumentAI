@@ -15,11 +15,6 @@ public class ChatController {
 
     private final ChatService chatService;
 
-    /**
-     * Start a RAG-based chat session.
-     * @param request JSON body with "query"
-     * @return The chatId to listen for in Firestore
-     */
     @PostMapping
     public ResponseEntity<Map<String, String>> startChat(
             @RequestBody Map<String, String> request,

@@ -21,10 +21,6 @@ public class DocumentController {
     private final DocumentIngestionService ingestionService;
     private final FirestoreService firestoreService;
 
-    /**
-     * Upload and process a PDF file for RAG.
-     * Requires Firebase authentication token in header.
-     */
     @PostMapping("/upload")
     public ResponseEntity<String> uploadDocument(
             @RequestParam("file") MultipartFile file,
@@ -46,9 +42,6 @@ public class DocumentController {
         }
     }
 
-    /**
-     * List all documents for the authenticated user.
-     */
     @GetMapping
     public ResponseEntity<List<Map<String, Object>>> listDocuments(
             @AuthenticationPrincipal String firebaseUid) {
@@ -59,9 +52,6 @@ public class DocumentController {
         }
     }
 
-    /**
-     * Delete a document.
-     */
     @DeleteMapping("/{id}")
     public ResponseEntity<String> deleteDocument(
             @PathVariable("id") String documentId,

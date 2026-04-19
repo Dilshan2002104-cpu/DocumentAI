@@ -4,13 +4,20 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
-import org.apache.pdfbox.text.PDFTextStripper;
+import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.document.Document;
+import org.springframework.ai.model.Media;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vertexai.gemini.VertexAiGeminiChatModel;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.stereotype.Service;
+import org.springframework.util.MimeType;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -24,71 +31,78 @@ public class DocumentIngestionService {
 
     private final VectorStore vectorStore;
     private final FirestoreService firestoreService;
+    private final VertexAiGeminiChatModel chatModel;
+
+    private static final String SMART_EXTRACT_PROMPT = """
+            Extract all text and structured information from this PDF page.
+            - Format any tables as Markdown tables.
+            - Describe any images or diagrams in detail.
+            - Output only the Markdown content.
+            """;
 
     public void ingestPdf(MultipartFile file, String userId) throws IOException {
-        log.info("Starting ingestion for: {} (size: {} bytes)", file.getOriginalFilename(), file.getSize());
+        log.info("Starting SMART ingestion for: {} (size: {} bytes)", file.getOriginalFilename(), file.getSize());
 
-        String rawText;
+        String documentId = UUID.randomUUID().toString();
+        List<Document> pageDocuments = new ArrayList<>();
+
         try (PDDocument document = Loader.loadPDF(file.getBytes())) {
-            PDFTextStripper stripper = new PDFTextStripper();
-            rawText = stripper.getText(document);
+            int totalPages = document.getNumberOfPages();
+            
+            for (int page = 1; page <= totalPages; page++) {
+                log.info("Processing page {} of {} using AI...", page, totalPages);
+                
+                try (PDDocument pageDoc = new PDDocument();
+                     ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                    
+                    pageDoc.addPage(document.getPage(page - 1));
+                    pageDoc.save(baos);
+                    byte[] pageBytes = baos.toByteArray();
+
+                    UserMessage userMessage = new UserMessage(
+                            SMART_EXTRACT_PROMPT,
+                            List.of(new Media(MimeType.valueOf("application/pdf"), new ByteArrayResource(pageBytes)))
+                    );
+
+                    ChatResponse response = chatModel.call(new Prompt(userMessage));
+                    String smartText = response.getResult().getOutput().getContent();
+
+                    if (smartText != null && !smartText.isBlank()) {
+                        pageDocuments.add(new Document(smartText, Map.of(
+                                "userId", userId,
+                                "documentId", documentId,
+                                "fileName", file.getOriginalFilename(),
+                                "pageNumber", page,
+                                "contentType", "application/pdf",
+                                "is_cache", false
+                        )));
+                    }
+                }
+            }
         }
 
-        if (rawText == null || rawText.isBlank()) {
+        if (pageDocuments.isEmpty()) {
             throw new RuntimeException("Could not extract any text from the PDF: " + file.getOriginalFilename());
         }
 
-        // 2. Wrap in a Document and split using the splitter
-        String documentId = UUID.randomUUID().toString();
-        Document initialDocument = new Document(rawText, Map.of(
-                "userId", userId,
-                "documentId", documentId,
-                "fileName", file.getOriginalFilename(),
-                "contentType", "application/pdf"
-        ));
-
         TokenTextSplitter splitter = new TokenTextSplitter(800, 400, 5, 1000, true);
-        List<Document> chunks = splitter.apply(List.of(initialDocument));
+        List<Document> chunks = splitter.apply(pageDocuments);
         
-        // 3. Assign deterministic IDs to chunks so we can delete them later
         List<Document> documentsWithIds = new ArrayList<>();
-        List<String> chunkIds = new ArrayList<>();
         for (int i = 0; i < chunks.size(); i++) {
             String id = documentId + "_" + i;
             Document chunk = chunks.get(i);
-            // Re-create document with the same context but explicit ID
             documentsWithIds.add(new Document(id, chunk.getText(), chunk.getMetadata()));
-            chunkIds.add(id);
         }
 
-        // 4. Save to ChromaDB
         vectorStore.add(documentsWithIds);
-        
-        // 5. Save Metadata to Firestore for easy listing/deletion
         firestoreService.saveDocumentMetadata(documentId, userId, file.getOriginalFilename(), file.getSize());
-        // Also save chunk IDs in a separate field if needed, but here simple prefix works
         
-        log.info("Successfully ingested {} chunks into ChromaDB with DocID: {}", documentsWithIds.size(), documentId);
+        log.info("Successfully ingested {} chunks into ChromaDB with Smart Parsing. DocID: {}", documentsWithIds.size(), documentId);
     }
 
-    /**
-     * Delete a document and its vectors.
-     */
     public void deleteDocument(String documentId, String userId) {
         log.info("Deleting document {} for user {}", documentId, userId);
-        
-        // 1. In a real system, we'd fetch chunk IDs. 
-        // Here, since we used deterministic IDs (docId_0, docId_1...), 
-        // we can try deleting a range or just searching.
-        // For simplicity with the current VectorStore interface, 
-        // we'll assume we know the chunks or we use a clean docId.
-        
-        // Note: Spring AI VectorStore.delete() usually takes a list of exact IDs.
-        // We'll delete the metadata from Firestore first.
         firestoreService.deleteDocumentMetadata(documentId);
-        
-        // Deleting from Chroma usually requires the exact IDs of all chunks.
-        // Finding them might require a search or storing them.
-        log.warn("Vector deletion for {} requires exact chunk IDs. Implementation limited by VectorStore interface.", documentId);
     }
 }

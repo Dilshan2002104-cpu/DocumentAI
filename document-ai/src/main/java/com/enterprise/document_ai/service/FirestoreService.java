@@ -14,20 +14,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
-/**
- * Service to handle real-time status and message updates to Firebase Firestore.
- * This allows the frontend to listen to a specific document for streaming AI responses.
- */
 @Service
 @Slf4j
 public class FirestoreService {
 
-    /**
-     * Creates or updates a chat message document in Firestore.
-     * @param chatId Unique ID for the chat session
-     * @param content The current accumulated or partial content
-     * @param isComplete Whether the AI has finished generating
-     */
     public void updateChatStatus(String chatId, String content, boolean isComplete) {
         try {
             Firestore db = FirestoreClient.getFirestore();
@@ -37,7 +27,6 @@ public class FirestoreService {
             data.put("isComplete", isComplete);
             data.put("updatedAt", System.currentTimeMillis());
 
-            // Write to the "chats" collection
             db.collection("chats").document(chatId).set(data);
             
         } catch (Exception e) {
@@ -45,9 +34,6 @@ public class FirestoreService {
         }
     }
 
-    /**
-     * Store metadata about uploaded documents.
-     */
     public void saveDocumentMetadata(String documentId, String userId, String fileName, long size) {
         try {
             Firestore db = FirestoreClient.getFirestore();
@@ -64,9 +50,6 @@ public class FirestoreService {
         }
     }
 
-    /**
-     * List all documents for a specific user.
-     */
     public List<Map<String, Object>> getUserDocuments(String userId) throws ExecutionException, InterruptedException {
         Firestore db = FirestoreClient.getFirestore();
         ApiFuture<QuerySnapshot> future = db.collection("documents")
@@ -81,10 +64,24 @@ public class FirestoreService {
         return result;
     }
 
-    /**
-     * Remove metadata.
-     */
     public void deleteDocumentMetadata(String documentId) {
         FirestoreClient.getFirestore().collection("documents").document(documentId).delete();
+    }
+
+    public void saveAuditLog(String userId, String chatId, String query, String response, List<String> sources) {
+        try {
+            Firestore db = FirestoreClient.getFirestore();
+            Map<String, Object> logEntry = new HashMap<>();
+            logEntry.put("userId", userId);
+            logEntry.put("chatId", chatId);
+            logEntry.put("query", query);
+            logEntry.put("response", response);
+            logEntry.put("sources", sources);
+            logEntry.put("timestamp", System.currentTimeMillis());
+
+            db.collection("audit_logs").document(chatId).set(logEntry);
+        } catch (Exception e) {
+            log.error("Failed to save audit log: {}", e.getMessage());
+        }
     }
 }

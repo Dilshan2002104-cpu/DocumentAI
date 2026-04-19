@@ -3,6 +3,7 @@ package com.enterprise.document_ai.service;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.chat.prompt.SystemPromptTemplate;
 import org.springframework.ai.document.Document;
@@ -28,6 +29,11 @@ public class ChatService {
     private static final String SYSTEM_PROMPT = """
             You are a helpful Enterprise AI assistant. 
             Use the following context from uploaded PDF documents to answer the user's question.
+            Each piece of context is prefixed with its source file and page number.
+            
+            IMPORTANT: When you use information from the context, you MUST cite the source 
+            at the end of the sentence or paragraph, for example: (Source: doc.pdf, Page: 5).
+            
             If you don't know the answer based on the context, just say you don't know. 
             Do not make up information.
             
@@ -35,60 +41,99 @@ public class ChatService {
             {context}
             """;
 
-    /**
-     * Retrieves context, calls Gemini, and streams the response to Firestore.
-     * @param query The user's question
-     * @param userId To filter documents belonging to this user
-     * @return A unique chatId that the frontend can listen to
-     */
     public String chatWithDocuments(String query, String userId) {
         String chatId = UUID.randomUUID().toString();
-        log.info("Starting Chat RAG session: {} for user: {}", chatId, userId);
+        log.info("Starting Hybrid Chat session with Semantic Cache: {} for user: {}", chatId, userId);
 
-        // 1. Retrieval: Find top 4 relevant chunks for this user
-        SearchRequest searchRequest = SearchRequest.builder()
+        SearchRequest cacheRequest = SearchRequest.builder()
                 .query(query)
-                .topK(4)
-                .filterExpression("userId == '" + userId + "'")
+                .topK(1)
+                .similarityThreshold(0.95)
+                .filterExpression("is_cache == true")
                 .build();
         
-        List<Document> relevantDocs = vectorStore.similaritySearch(searchRequest);
-        
-        String context = relevantDocs.stream()
-                .map(Document::getText)
-                .collect(Collectors.joining("\n\n"));
+        List<Document> cachedResults = vectorStore.similaritySearch(cacheRequest);
+        if (!cachedResults.isEmpty()) {
+            log.info("Semantic Cache HIT for query: {}", query);
+            String cachedAnswer = cachedResults.get(0).getText();
+            firestoreService.updateChatStatus(chatId, cachedAnswer, true);
+            return chatId;
+        }
 
-        // 2. Augmentation: Build the prompt
+        String expansionPrompt = String.format(
+                "Generate 2 diverse search queries for a vector database based on this: \"%s\".", query);
+        
+        ChatResponse expansionResponse = chatModel.call(new Prompt(expansionPrompt));
+        String[] expandedQueries = expansionResponse.getResult().getOutput().getContent().split("\n");
+        
+        List<Document> allRelevantDocs = new java.util.ArrayList<>();
+        allRelevantDocs.addAll(performSearch(query, userId));
+        
+        for (String q : expandedQueries) {
+            if (!q.isBlank()) allRelevantDocs.addAll(performSearch(q.trim(), userId));
+        }
+
+        List<Document> uniqueDocs = allRelevantDocs.stream()
+                .distinct()
+                .limit(8)
+                .toList();
+
+        String context = uniqueDocs.stream()
+                .map(doc -> String.format("[Source: %s, Page: %s]\n%s", 
+                        doc.getMetadata().getOrDefault("fileName", "Unknown"),
+                        doc.getMetadata().getOrDefault("pageNumber", "N/A"),
+                        doc.getText()))
+                .collect(Collectors.joining("\n\n---\n\n"));
+
         SystemPromptTemplate systemPromptTemplate = new SystemPromptTemplate(SYSTEM_PROMPT);
         org.springframework.ai.chat.messages.Message systemMessage = systemPromptTemplate.createMessage(Map.of("context", context));
         UserMessage userMessage = new UserMessage(query);
         
         Prompt prompt = new Prompt(List.of(systemMessage, userMessage));
 
-        // 3. Generation & Streaming:
-        // Use Flux to handle the stream and write to Firestore
         StringBuilder fullResponse = new StringBuilder();
-        
         chatModel.stream(prompt).subscribe(
             response -> {
                 String chunk = response.getResult().getOutput().getContent();
                 if (chunk != null) {
                     fullResponse.append(chunk);
-                    // Update Firestore with the current text
                     firestoreService.updateChatStatus(chatId, fullResponse.toString(), false);
                 }
             },
             error -> {
-                log.error("Streaming error for chatId {}: {}", chatId, error.getMessage());
-                firestoreService.updateChatStatus(chatId, "Error: AI failed to generate response.", true);
+                log.error("Streaming error: {}", error.getMessage());
+                firestoreService.updateChatStatus(chatId, "Error generating response.", true);
             },
             () -> {
-                log.info("Finished streaming for chatId: {}", chatId);
-                // Mark as complete
-                firestoreService.updateChatStatus(chatId, fullResponse.toString(), true);
+                String finalResult = fullResponse.toString();
+                firestoreService.updateChatStatus(chatId, finalResult, true);
+                
+                Document cacheDoc = new Document(finalResult, Map.of(
+                        "is_cache", true,
+                        "original_query", query,
+                        "userId", userId
+                ));
+                vectorStore.add(List.of(cacheDoc));
+
+                List<String> sourceFiles = uniqueDocs.stream()
+                        .map(doc -> doc.getMetadata().getOrDefault("fileName", "Unknown").toString())
+                        .distinct()
+                        .toList();
+                firestoreService.saveAuditLog(userId, chatId, query, finalResult, sourceFiles);
+                
+                log.info("Saved response to Semantic Cache and Audit Logs.");
             }
         );
 
         return chatId;
+    }
+
+    private List<Document> performSearch(String query, String userId) {
+        SearchRequest searchRequest = SearchRequest.builder()
+                .query(query)
+                .topK(3)
+                .filterExpression("userId == '" + userId + "' && is_cache == false")
+                .build();
+        return vectorStore.similaritySearch(searchRequest);
     }
 }

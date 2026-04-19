@@ -1,0 +1,25 @@
+# Compiled class files
+target/
+*.class
+
+# Log files
+*.log
+
+# Project specific
+.DS_Store
+.idea/
+*.iml
+.vscode/
+
+# Credentials (CRITICAL)
+Documentai-API-Key.json
+firebase-service-account.json
+
+# Local Environment
+.env
+chroma_data/
+
+# Maven
+.mvn/
+mvnw
+mvnw.cmd
